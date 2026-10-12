@@ -16,5 +16,11 @@ applies to every contribution you submit to this repository ("Contribution").
    submit it under this agreement; that it does not include anything you know to infringe someone else's rights;
    and that, if your employer has rights to your work, they have allowed you to contribute it.
 5. **No obligation.** We do not have to use your Contribution. It is provided "as is", without warranties.
+6. **If something changes.** You will tell us if you learn of anything that makes your statement in section 4
+   untrue.
+7. **Successors.** We may transfer this agreement to whoever takes over Vocnu; the licenses you granted continue.
+8. **Law.** This agreement is governed by the laws of the Republic of Lithuania.
 
-You accept this agreement by stating in your pull request that you agree to it.
+You accept this agreement, once for all your Contributions, by commenting on your first pull request:
+"I have read the CLA Document and I hereby sign the CLA". The CLA bot records your GitHub account, the pull
+request and the time.

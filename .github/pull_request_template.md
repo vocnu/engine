@@ -5,4 +5,4 @@
 ## Checks
 
 - [ ] `uv run pytest` passes
-- [ ] I have read and agree to the [Contributor License Agreement](../CLA.md)
+- [ ] I have signed the [Contributor License Agreement](../CLA.md) (the CLA bot asks once, with a comment)
