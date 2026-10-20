@@ -19,7 +19,9 @@ uvx --from git+https://github.com/vocnu/engine vocnu-engine translate film.mkv -
   how names are written and declined), chunked translation with context, an independent review, and per-line
   character budgets so every narrator line fits the time it has.
 - **Narration** with ElevenLabs voices and character timestamps; lines that run long are retaken, rephrased
-  shorter and only then sped up (at most 1.08×).
+  shorter and only then sped up (at most 1.08×). Names the voice says the source language's way
+  (Lithuanian "Aliaska" read as English "Alaska") are found by recognising takes again and respelled for the voice
+  only; codes such as "C-46" are said as words while the subtitles keep them as written.
 - **Mixing**: the original is dipped under each narrator line and mastered; video outputs keep the original
   audio as a second track.
 - **Outputs**: MP4, MKV, MOV, WebM or AVI with switchable subtitle tracks; M4A, MP3, WAV, FLAC or OGG audio;
@@ -44,6 +46,7 @@ vocnu-engine translate film.mkv --to lt                 # video with voice-over 
 vocnu-engine translate talk.mp3 --to de --output audio  # voice-over audio only
 vocnu-engine translate film.mp4 --to es --output subtitles
 vocnu-engine translate film.mp4 --to fr --voice male --format mkv --burn-subtitles --budget 5
+vocnu-engine translate film.mp4 --to lt --format mp4,mkv  # the video as an MP4 and as an MKV
 vocnu-engine probe film.mkv                              # length and tracks
 vocnu-engine languages
 ```
@@ -54,7 +57,7 @@ vocnu-engine languages
 | `--from` | spoken language, if detection gets it wrong |
 | `--output` | `video` (default for videos), `audio` or `subtitles` |
 | `--voice` | `female` (default) or `male` |
-| `--format`, `--audio-format` | video and audio file formats |
+| `--format`, `--audio-format` | video and audio file formats; `--format mp4,mkv` makes the video in each |
 | `--burn-subtitles` | subtitles drawn into the picture |
 | `--budget` | hard limit in USD on what your keys may spend for this file (default: $0.15 per minute) |
 | `--out` | folder for the results (default: `<file> (vocnu <lang>)` next to it) |

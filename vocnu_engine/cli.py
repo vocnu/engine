@@ -46,6 +46,14 @@ def _products(value):
     return {name: True for name in names}
 
 
+def _video_formats(value):
+    """`mkv` or several formats at once, `mp4,mkv`: each comes as its own file."""
+    names = list(dict.fromkeys(name.strip().lower() for name in value.split(',') if name.strip()))
+    if not names or any(name not in render.VIDEO_FORMATS for name in names):
+        raise argparse.ArgumentTypeError(f'choose from {", ".join(render.VIDEO_FORMATS)}, separated by commas')
+    return names
+
+
 def products_for(output, burn_subtitles=False):
     """The job products of an output, as the Vocnu app and CLI choose them: every output includes subtitles."""
     return {'subtitles': True, 'voiceover_audio': output != 'subtitles', 'voiceover_video': output == 'video',
@@ -73,8 +81,9 @@ def _parser():
     translate.add_argument('--from', dest='source_language', default='auto', help='spoken language (default: detected)')
     translate.add_argument('--output', choices=OUTPUTS, help='video (default for videos), audio or subtitles only')
     translate.add_argument('--voice', default='female', choices=('female', 'male'))
-    translate.add_argument('--format', dest='video_format', choices=render.VIDEO_FORMATS,
-                           help="video file format (default: the source's, else mp4)")
+    translate.add_argument('--format', dest='video_formats', type=_video_formats,
+                           help=f"video file format ({', '.join(render.VIDEO_FORMATS)}), or several separated by "
+                                "commas, e.g. mp4,mkv (default: the source's, else mp4)")
     translate.add_argument('--audio-format', default='m4a', choices=tuple(AUDIO_CODECS))
     translate.add_argument('--burn-subtitles', action='store_true', help='burn the subtitles into the picture')
     translate.add_argument('--budget', type=float, default=None,
@@ -135,13 +144,13 @@ def _translate(args):
         print('This file has no picture: use --output audio or --output subtitles.', file=sys.stderr)
         return 2
     suffix = path.suffix.lower().lstrip('.')
-    video_format = args.video_format or (suffix if suffix in render.VIDEO_FORMATS else 'mp4')
+    video_formats = args.video_formats or [suffix if suffix in render.VIDEO_FORMATS else 'mp4']
     budget = args.budget if args.budget is not None else max(1.0, round(
         facts['duration_seconds'] / 60 * BUDGET_PER_MINUTE, 2))
     print(f'Spending at most ${budget:.2f} of your provider credit (change it with --budget).')
     job_id = str(uuid.uuid4())
     job = _job(job_id, source, facts, source_language=args.source_language, target_language=args.to,
-               products=products_for(output, args.burn_subtitles), voice=args.voice, video_format=video_format,
+               products=products_for(output, args.burn_subtitles), voice=args.voice, video_formats=video_formats,
                audio_format=args.audio_format, budget_usd=budget,
                names_api=None if args.no_names_library else args.names_api)
     folder = Path(args.out) if args.out else path.parent / f'{path.stem} (vocnu {args.to})'

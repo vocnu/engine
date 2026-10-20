@@ -38,7 +38,7 @@ def test_other_languages_and_voices_keep_stock_voices():
     assert tts.voice_for('male') == tts.VOICES['male']
 
 
-def test_lithuanian_is_spoken_by_eleven_v4_and_other_languages_by_v3(monkeypatch, tmp_path):
+def test_lithuanian_is_spoken_by_eleven_v4_turbo_and_other_languages_by_v3(monkeypatch, tmp_path):
     monkeypatch.setenv('ELEVENLABS_API_KEY', 'test-key')
     models = []
 
@@ -50,7 +50,7 @@ def test_lithuanian_is_spoken_by_eleven_v4_and_other_languages_by_v3(monkeypatch
     tts.synthesize('Labas', 'lt', 'male', tmp_path, Receipt(max_usd=1))
     tts.synthesize('Hallo', 'de', 'male', tmp_path, Receipt(max_usd=1))
 
-    assert models == ['eleven_v4', 'eleven_v3']
+    assert models == ['eleven_v4_turbo', 'eleven_v3']
 
 
 def test_unknown_voice_is_rejected():

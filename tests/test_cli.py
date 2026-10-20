@@ -22,6 +22,17 @@ def test_translate_saves_a_video_with_its_subtitles_and_receipt(clip, fake_provi
     assert 'Spent $' in capsys.readouterr().out
 
 
+def test_translate_makes_the_video_in_every_format_asked_for(clip, fake_providers, heard, tmp_path, capsys):
+    out = tmp_path / 'results'
+    assert cli.main(['translate', str(clip), '--to', 'lt', '--format', 'mp4,MKV', '--out', str(out), '--work',
+                     str(tmp_path / 'work'), '--budget', '0.5', '--no-names-library']) == 0
+    names = {path.name for path in out.iterdir()}
+    assert {'video.lt.mp4', 'video.lt.mkv'} <= names
+    with pytest.raises(SystemExit):
+        cli.main(['translate', str(clip), '--to', 'lt', '--format', 'mp4,flv'])
+    assert 'argument --format: choose from mp4, mov, mkv' in capsys.readouterr().err
+
+
 def test_translate_audio_only_and_its_cache_folder_goes_after_success(clip, fake_providers, heard, tmp_path,
                                                                       monkeypatch):
     monkeypatch.setenv('XDG_CACHE_HOME', str(tmp_path / 'cache'))

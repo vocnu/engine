@@ -14,8 +14,8 @@ import re
 import threading
 import time
 
-from . import (asr, bitmap_subtitles, file_subtitles, fitting, media, mix, render, segments, sources, speakers,
-               subtitles, titles, translate, tts)
+from . import (asr, bitmap_subtitles, file_subtitles, fitting, media, mix, pronounce, render, segments, sources,
+               speakers, spoken as speech, subtitles, titles, translate, tts)
 from .costs import MODAL_CORE_USD_PER_SECOND, MODAL_L4_USD_PER_SECOND, BudgetExceeded, Receipt
 from .errors import WorkerError
 from .languages import BY_CODE, code_for_tag, get, track_tag
@@ -66,9 +66,11 @@ def validate(job):
         if not isinstance(override, dict) or not re.fullmatch(r'[A-Za-z0-9]{8,64}', str(override.get('id'))) \
                 or not 0 < len(str(override.get('name') or '')) <= 60 or len(str(override.get('credit') or '')) > 100:
             raise ValueError('Invalid voice_override')
-    video_format = job.get('video_format') or 'mp4'
-    if video_format not in render.VIDEO_FORMATS:
+    # Every format the voice-over video comes in, each its own file; Rails before ADR 0024 sends only video_format.
+    video_formats = job.get('video_formats') or [job.get('video_format') or 'mp4']
+    if not isinstance(video_formats, list) or not all(name in render.VIDEO_FORMATS for name in video_formats):
         raise ValueError('Invalid video_format')
+    video_formats = list(dict.fromkeys(video_formats))
     audio_format = job.get('audio_format') or 'm4a'
     if audio_format not in media.AUDIO_CODECS:
         raise ValueError('Invalid audio_format')
@@ -77,17 +79,19 @@ def validate(job):
     if max_duration <= 0 or budget <= 0 or budget > 200:
         raise ValueError('Invalid duration or budget limits')
     return {**job, 'source_language': source_language, 'products': products, 'voice': voice,
-            'voice_override': override,
-            'video_format': video_format, 'audio_format': audio_format,
+            'voice_override': override, 'original_audio': job.get('original_audio') is True,
+            'video_format': video_formats[0], 'video_formats': video_formats, 'audio_format': audio_format,
             'max_duration_seconds': max_duration, 'budget_usd': budget}
 
 
 class _Progress:
-    def __init__(self, sink, stages, clock=time.monotonic):
+    def __init__(self, sink, stages, clock=time.monotonic, repeats=None):
+        """`repeats`: {stage: times it runs}, e.g. rendering once per video format."""
         self.sink, self.stages, self.clock = sink, stages, clock
         self.entered = {}   # stage -> when it started
-        total = sum(STAGE_SECONDS_PER_MINUTE[stage] for stage in stages)
-        shares = [STAGE_SECONDS_PER_MINUTE[stage] / total for stage in stages]
+        self.per_minute = {stage: STAGE_SECONDS_PER_MINUTE[stage] * (repeats or {}).get(stage, 1) for stage in stages}
+        total = sum(self.per_minute.values())
+        shares = [self.per_minute[stage] / total for stage in stages]
         self.start = {stage: sum(shares[:i]) for i, stage in enumerate(stages)}
         self.end = {stage: self.start[stage] + share for stage, share in zip(stages, shares)}
         self.media_minutes = 0.0
@@ -117,7 +121,7 @@ class _Progress:
             stage = self.current
             if stage is None or self.media_minutes <= 0:
                 return
-            expected = STAGE_SECONDS_PER_MINUTE[stage] * self.media_minutes
+            expected = self.per_minute[stage] * self.media_minutes
             fraction = min(TICK_CAP, (self.clock() - self.entered[stage]) / expected)
             if fraction <= self.reached.get(stage, 0.0):
                 return
@@ -323,7 +327,7 @@ def process(job, workdir, *, store, sink, transcribe, compute='local', cpu_cores
         if wants_voice:
             stages += ['synthesizing', 'mixing'] + (['rendering'] if products['voiceover_video'] else [])
         stages.append('uploading')
-        progress = _Progress(sink, stages)
+        progress = _Progress(sink, stages, repeats={'rendering': len(job['video_formats'])})
         work = Path(workdir)
         work.mkdir(parents=True, exist_ok=True)
 
@@ -452,8 +456,8 @@ def process(job, workdir, *, store, sink, transcribe, compute='local', cpu_cores
         # Song lyrics and on-screen text (`sung`) get subtitles but no narration. Sounds without words (screams,
         # laughs, sobs) and recognition artefacts (`silent`) get neither: the original soundtrack keeps them.
         sung, silent = analysis['sung'], analysis.get('silent') or set()
-        # Case forms of names are decided per job: Rails keeps only base renderings.
-        glossary = translate.with_forms(glossary, analysis.get('forms'))
+        # Case forms of names and the spoken words of codes are decided per job: Rails keeps only base renderings.
+        glossary = translate.with_forms(glossary, analysis.get('forms'), analysis.get('spoken'))
         quality = {}
         # Song lyrics and signs from the upload's own subtitles, translated line by line at their authored times, at
         # the top of the picture; they replace the lyrics speech recognition caught of the same songs. Inside a song
@@ -479,9 +483,12 @@ def process(job, workdir, *, store, sink, transcribe, compute='local', cpu_cores
         spoken = {uid for uid, said in evidence.items() if any(not name.endswith(' dub') for name in said)}
         in_songs = {u.id for u in units if _inside(u, regions) and u.id not in spoken}
         silent, sung = silent | in_songs, sung - in_songs
+        # A voice-over's subtitles show what the narrator says (below), so its dialogue is translated as narrator lines
+        # only: no second, per-cue translation that nobody would see.
         translations = translate.translate([u for u in units if u.id not in silent], cues, source=source_language,
                                            target=target, budgets=budgets, receipt=receipt, speakers=speaker_genders,
-                                           glossary=glossary, sung=sung, stats=quality, evidence=evidence)
+                                           glossary=glossary, sung=sung, stats=quality, evidence=evidence,
+                                           narration_only=wants_voice)
         for unit in units:
             if unit.id in silent:
                 translations[unit.id] = {'voiceover': '', 'subtitles': [''] * len(unit.cue_ids)}
@@ -499,6 +506,7 @@ def process(job, workdir, *, store, sink, transcribe, compute='local', cpu_cores
         source_cues = [(c.start, c.end, c.text) for c in cues if c.id not in from_subtitles]
         src_lang = BY_CODE.get(source_language)
         files = {}
+        videos = []   # (path, language): the voice-over video, one per chosen format
         sub_dir = work / 'subtitles'
         all_cues = subtitles.layered(target_cues, overlay_cues)
         target_srt = _write(sub_dir / f'subtitles.{target}.srt', subtitles.srt(all_cues, lang.line_chars, lang.spaced))
@@ -524,9 +532,9 @@ def process(job, workdir, *, store, sink, transcribe, compute='local', cpu_cores
                  'turn_candidates': len(candidates), 'turn_splits': len(turn_starts),
                  **quality}
         if wants_voice:
-            # 4. Speech at natural speed, fitted into gap-aware timing budgets (timing.py): lines that do not fit get
-            # same-text retakes (short ones) or measured rephrasing, kept only when the take is shorter and timing
-            # improves; a little speed-up only as the last resort (fitting.py).
+            # 4. Speech at natural speed, fitted into gap-aware timing budgets (timing.py): every line is measured
+            # first, takes that do not fit get same-text retakes (short ones) or measured rephrasing, kept only when
+            # the take is shorter and timing improves; a little speed-up only as the last resort (fitting.py).
             progress('synthesizing')
             translated = {u.id: translations[u.id]['voiceover'] for u in units if translations[u.id]['voiceover']}
             done = [0]
@@ -536,11 +544,43 @@ def process(job, workdir, *, store, sink, transcribe, compute='local', cpu_cores
                 if done[0] % 5 == 0 or done[0] == len(translated):
                     progress('synthesizing', 0.8 * done[0] / max(1, len(translated)))
 
+            # Names the narrator voice says the source-language way (eleven_v4 read Lithuanian "Aliaska" as English
+            # "Alaska") are found by recognising some of its takes again and get a respelling for the voice only.
+            checked = {}
+
+            def respell(narrated, table):
+                if source_language == target:
+                    return {}
+                chosen, report, seconds = pronounce.respellings(
+                    narrated, glossary, language=target, voice=voice, cache=work / 'tts', receipt=receipt,
+                    transcribe=transcribe, table=table, work=work / 'names', source=source_language)
+                checked.update(report=report, seconds=checked.get('seconds', 0.0) + seconds)
+                return chosen
+
+            def verify(takes):
+                # The finished takes: a name the narrator slipped on gets one more take (fitting.verify).
+                if source_language == target:
+                    return {}
+                flagged, report, seconds = pronounce.heard_wrong(takes, glossary, language=target,
+                                                                 transcribe=transcribe, work=work / 'names',
+                                                                 name=f"final-{checked.get('rounds', 0)}")
+                checked['rounds'] = checked.get('rounds', 0) + 1
+                checked['seconds'] = checked.get('seconds', 0.0) + seconds
+                checked.setdefault('final', report)
+                return flagged
+
             narration = fitting.narrate(units, translated, media_duration=duration, language=target, voice=voice,
                                         cache=work / 'tts', receipt=receipt, cues=cues, speakers=speaker_genders,
-                                        glossary=glossary, on_done=tick)
-            lines, placements = narration.lines, narration.placements
+                                        glossary=glossary, on_done=tick, spoken=speech.table(glossary),
+                                        respell=respell, verify=verify)
+            gpu_seconds += checked.get('seconds', 0.0)
+            lines, placements, said = narration.lines, narration.placements, narration.spoken or {}
             stats['timing'] = narration.report
+            if checked.get('report'):
+                stats['pronunciation'] = checked['report']
+            if checked.get('final'):
+                stats.setdefault('pronunciation', {})['final'] = {
+                    **checked['final'], 'retaken': narration.report.get('names_retaken', 0)}
             progress('synthesizing', 1.0)
 
             # 5. Mix over the ducked original, normalise to -16 LUFS, encode.
@@ -551,24 +591,28 @@ def process(job, workdir, *, store, sink, transcribe, compute='local', cpu_cores
             def rounded(record):
                 return {k: round(v, 3) if isinstance(v, float) else v for k, v in vars(record).items()}
 
+            voiced = {uid: words for uid, text in lines.items()
+                      if (words := speech.spoken_text(text, said, lang.spaced)) != text}
             _write(work / 'plan.json', json.dumps({'units': [
                 {'id': u.id, 'start': u.start, 'end': u.end, 'source': u.text, 'voiceover': lines.get(u.id, ''),
+                 **({'spoken': voiced[u.id]} if u.id in voiced else {}),
                  'speech_seconds': round(narration.seconds.get(u.id, 0.0), 3),
                  **({'translated': rephrased[u.id]} if u.id in rephrased else {}),
                  **({'sung': True} if u.id in sung else {}), **({'missing_speech': True} if u.id in missing else {})}
-                for u in units], 'title': title, 'glossary': glossary,
+                for u in units], 'title': title, 'glossary': glossary, 'spoken_forms': said,
                 'placements': [rounded(p) for p in placements],
                 'timing': {**narration.report, 'off_budget': [rounded(v) for v in narration.violations]}},
                 ensure_ascii=False, indent=1))
             # Subtitles delivered with a voice-over show what the narrator says (the faithful per-cue translation
             # differs from the shortened narration, and viewers notice when text and voice disagree), timed by the
-            # take's character timestamps, plus the translated lyrics of songs and the translation of any line whose
-            # speech came back silent: neither is narrated.
+            # take's character timestamps (of the written line where the narrator says other words), plus the translated
+            # lyrics of songs and the translation of any line whose speech came back silent: neither is narrated.
             unspoken = {c for u in units if u.id in missing for c in u.cue_ids}
             unspoken_cues = [cue for c, cue in zip(cues, target_cues) if c.id in unspoken]
             narrated_cues = subtitles.narration_cues(
                 placements, lines, lang.line_chars, lang.spaced, duration=duration, reading_cps=lang.reading_cps,
-                alignments={uid: tts.alignment(path) for uid, path in narration.paths.items()})
+                alignments={uid: speech.written_alignment(tts.alignment(path), lines[uid], said, lang.spaced)
+                            for uid, path in narration.paths.items()})
             voice_cues = subtitles.layered(subtitles.merge(narrated_cues, sung_cues, unspoken_cues), overlay_cues)
             if products['subtitles']:
                 files['subtitles_srt'] = (_write(sub_dir / f'subtitles.{target}.srt',
@@ -585,36 +629,49 @@ def process(job, workdir, *, store, sink, transcribe, compute='local', cpu_cores
                                        credit=credit)
             if products['voiceover_audio']:
                 files['voiceover_audio'] = (audio, target)
+            # The original soundtrack on its own, which the share page plays in step with the muted video when a
+            # viewer picks the original language. Rails asks for it (`original_audio`) once it stores the file. It is
+            # the player's, not a result: a file that cannot be made leaves the player as it was, never fails the job.
+            if job['original_audio']:
+                try:
+                    files['original_audio'] = (render.original_audio(
+                        source_path, work / f'original.{source_language}.m4a', info=info,
+                        source_language=source_language), source_language)
+                except media.MediaError:
+                    log.warning('original soundtrack not made', exc_info=True)
 
             # 6. Video: copy the picture, voice-over first, original second, subtitles as switchable tracks (off by
-            # default); burned into the picture only on request, and then not repeated as a track.
+            # default); burned into the picture only on request, and then not repeated as a track. One file per
+            # chosen format; a picture that must be encoded is encoded once and copied into the other formats.
             if products['voiceover_video']:
                 progress('rendering')
                 burn = None
-                tracks = [(_write(work / 'tracks' / f'transcript.{source_language}.srt', subtitles.srt(
+                transcript_track = (_write(work / 'tracks' / f'transcript.{source_language}.srt', subtitles.srt(
                     source_cues, src_lang.line_chars if src_lang else 42, src_lang.spaced if src_lang else True)),
-                    track_tag(source_language), f'Transcript ({src_lang.native if src_lang else source_language})')]
+                    track_tag(source_language), f'Transcript ({src_lang.native if src_lang else source_language})')
                 if products['burned_subtitles']:
                     burn = _write(work / 'burn' / 'burn.srt',
                                   subtitles.srt(voice_cues, lang.line_chars, lang.spaced))
-                elif render.CONTAINERS[job['video_format']].subtitles == 'ass':
-                    # MKV holds styled subtitles: song lyrics and signs keep their place at the top.
-                    tracks.insert(0, (_write(work / 'tracks' / f'subtitles.{target}.ass',
-                                             subtitles.ass(voice_cues, lang.line_chars, lang.spaced)),
-                                      track_tag(target), f'Subtitles ({lang.native})'))
-                else:
-                    tracks.insert(0, (_write(work / 'tracks' / f'subtitles.{target}.srt',
-                                             subtitles.srt(voice_cues, lang.line_chars, lang.spaced)),
-                                      track_tag(target), f'Subtitles ({lang.native})'))
-                video = render.video(source_path, mixed['voiceover_wav'], work / f"video.{target}.{job['video_format']}",
-                                     info=info, target=target, source_language=source_language, burn_srt=burn,
-                                     subtitle_tracks=tracks, threads=cpu_cores, credit=credit)
-                files['voiceover_video'] = (video, target)
+                renders = []
+                for name in job['video_formats']:
+                    tracks = [transcript_track]
+                    if burn is None:
+                        # MKV holds styled subtitles: song lyrics and signs keep their place at the top.
+                        styled = render.CONTAINERS[name].subtitles == 'ass'
+                        text = (subtitles.ass if styled else subtitles.srt)(voice_cues, lang.line_chars, lang.spaced)
+                        tracks.insert(0, (_write(work / 'tracks' / f"subtitles.{target}.{'ass' if styled else 'srt'}",
+                                                 text), track_tag(target), f'Subtitles ({lang.native})'))
+                    renders.append((work / f'video.{target}.{name}', tracks))
+                made = render.videos(source_path, mixed['voiceover_wav'], renders, info=info, target=target,
+                                     source_language=source_language, burn_srt=burn, threads=cpu_cores, credit=credit,
+                                     voice_track=audio,
+                                     rendered=lambda done: progress('rendering', done / len(renders)))
+                videos.extend((video, target) for video in made)
 
         # 7. Upload.
         progress('uploading')
         outputs = []
-        for kind, (path, language) in files.items():
+        for kind, (path, language) in [*files.items(), *(('voiceover_video', video) for video in videos)]:
             key = store.upload(path, output_key(job['job_id'], path.name), CONTENT_TYPES[path.suffix])
             outputs.append({'kind': kind, 'language': language, 'key': key,
                             'content_type': CONTENT_TYPES[path.suffix], 'bytes': path.stat().st_size})

@@ -24,11 +24,24 @@ HUNGARIAN_CASES = ('nominative', 'accusative', 'dative', 'instrumental', 'causal
                    'essive', 'inessive', 'superessive', 'adessive', 'illative', 'sublative', 'allative', 'elative',
                    'delative', 'ablative')
 
-# ai-voice-over v4 (Lithuanian localisation, human voice-over reference): foreign names take Lithuanian endings and
-# decline; a call uses the vocative; one narrator keeps every character's own grammatical gender.
+# ai-voice-over v4 (Lithuanian localisation, human voice-over reference): foreign people's names take Lithuanian
+# endings and decline; a call uses the vocative; one narrator keeps every character's own grammatical gender. Foreign
+# places are written as Lithuanian news write them: an established form (Kenajaus pusiasalis), otherwise spelled by
+# their sound with Lithuanian endings and declined (Bethel → Betelis, Betelyje), never a spelling that reads as another
+# word or a personal name, which keeps the original spelling (owner, 2026-10-19: an Alaskan town "Galena" had become
+# the woman's name "Galina", and "Moose Pass" the words "Mus Pasas"). Kept as written, "Bethel" stayed undeclined ("į
+# Bethel") and names got a doubled common noun ("Earthquake Park parkas") on 2026-10-20.
 LITHUANIAN_NOTE = (
-    'Lithuanian: give foreign names Lithuanian spelling and endings (Ichigo → Ičigas, Rukia → Rukija) unless the '
-    'glossary fixes another rendering, and decline them. Direct address uses the vocative (šauksmininkas): '
+    'Lithuanian: give foreign people\'s names the Lithuanian spelling of how they are said, with endings (Ichigo → '
+    'Ičigas, Rukia → Rukija, Gary → Geris) unless the glossary fixes another rendering, and decline them. A foreign '
+    'place uses its established Lithuanian form (Lake Michigan → Mičigano ežeras); without one it is written as '
+    'Lithuanian news write foreign places, by its sound with Lithuanian endings, and declined (Bakersfield → '
+    'Beikersfildas, Beikersfilde; Fort Worth → Fort Vortas). When that spelling would read as another Lithuanian word '
+    'or a personal name, the place keeps its original spelling: declined when it ends like a Lithuanian word '
+    '(Pasadena → Pasadenoje), otherwise with a common noun that takes the case (Silver Spring → Silver Spring '
+    'miestelyje). A company, brand, product, ship or aircraft keeps its original spelling. A nickname made of '
+    'adjectives takes their definite forms (the Red Baron → Raudonasis Baronas). Direct address uses the vocative '
+    '(šauksmininkas): '
     '"Mičanai!", "Ičigai, palauk!". A character\'s own gender shows in past tenses, participles and adjectives '
     '("buvau pavargęs" / "buvau pavargusi"), whoever reads the line. Mind look-alike verbs: liesti (to touch) is '
     'not lieti (to pour). Write everyday spoken Lithuanian: no bookish '

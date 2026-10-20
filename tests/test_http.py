@@ -60,6 +60,21 @@ def test_other_requests_keep_retrying_every_transient_failure():
     assert post(session).ok and session.calls == 4
 
 
+@pytest.mark.parametrize('max_wait, waited', [({}, 60.0), ({'max_wait': 5.0}, 5.0)])
+def test_the_wait_before_a_new_try_is_capped_whatever_retry_after_asks(monkeypatch, max_wait, waited):
+    class Full(Session):
+        def request(self, method, url, timeout=None, **kwargs):
+            response = super().request(method, url, timeout=timeout, **kwargs)
+            response.headers = {'Retry-After': '300'} if response.status_code == 429 else {}
+            return response
+
+    waits = []
+    monkeypatch.setattr(http.random, 'uniform', lambda a, b: 0.0)
+    assert http.request('POST', 'https://api.example.com/v1/responses', provider='Example', session=Full(429, 200),
+                        sleep=waits.append, **max_wait).ok
+    assert waits == [waited]
+
+
 @pytest.mark.parametrize('options', [{}, PAID])
 def test_a_rejected_request_is_not_retried(options):
     session = Session(400)

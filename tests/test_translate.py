@@ -72,7 +72,12 @@ class Router:
 
 
 def payload(body):
-    return json.loads(body['input'][1]['content'])
+    """What a request tells the model besides its instructions: the job's shared data (the glossary, its own message
+    right after the instructions, so OpenAI caches it) and the request's own data, merged."""
+    merged = {}
+    for message in body['input'][1:]:
+        merged.update(json.loads(message['content']))
+    return merged
 
 
 def instructions(body):
@@ -82,6 +87,7 @@ def instructions(body):
 @pytest.fixture(autouse=True)
 def fake_key(monkeypatch):
     monkeypatch.setenv('OPENAI_API_KEY', 'test-key')
+    monkeypatch.setattr(translate, '_flex_paused_until', [0.0])   # no test inherits another's flex pause
     monkeypatch.setattr('vocnu_engine.http.time.sleep', lambda s: None)
     monkeypatch.setattr('vocnu_engine.http.random.uniform', lambda a, b: 0)
 
@@ -98,7 +104,8 @@ def test_translation_parses_units_and_records_cost():
                                  session=session)
     assert result == {1: {'voiceover': 'Labas. Kaip sekasi?', 'subtitles': ['Labas.', 'Kaip sekasi?']}}
     body = session.bodies[0]
-    assert body['model'] == 'gpt-6.1-sol' and body['service_tier'] == 'default'
+    # Chunks go to the flex tier; the receipt prices the tier OpenAI says it used.
+    assert body['model'] == 'gpt-6.1-sol' and body['service_tier'] == 'flex'
     assert body['text']['format']['strict'] is True
     assert payload(body)['units'][0]['max_voiceover_chars'] == 50
     assert receipt.entries[0]['tier'] == 'default' and receipt.total_usd > 0
@@ -121,13 +128,49 @@ def test_mismatched_subtitles_are_retried_then_split_from_the_returned_text():
     assert stats['retried_units'] == 1
 
 
-def test_flex_capacity_errors_fall_back_to_default_tier():
-    session = Session([Response(429)] * 3 + [answer([{'id': 1, 'voiceover': 'Labas.', 'subtitles': ['a', 'b']}],
-                                                    tier='default')])
+def test_a_flex_refusal_is_tried_again_on_flex(monkeypatch):
+    session = Session([Response(429), answer([], tier='flex')])
     receipt = Receipt(max_usd=1)
     translate._call({'input': []}, receipt, 'translation', tier='flex', session=session)
-    assert [b['service_tier'] for b in session.bodies] == ['flex', 'flex', 'flex', 'default']
+    assert [b['service_tier'] for b in session.bodies] == ['flex', 'flex']
+    assert receipt.entries[0]['tier'] == 'flex' and translate._flex_paused_until[0] == 0.0
+
+
+def test_flex_is_tried_again_soon_however_long_its_refusal_asks_to_wait(monkeypatch):
+    waits = []
+    monkeypatch.setattr('vocnu_engine.http.time.sleep', waits.append)
+    full = Response(429)
+    full.headers = {'Retry-After': '300'}   # what flex answered on 2026-10-20, though a try 2 s later got through
+    session = Session([full, full, answer([], tier='flex')])
+    translate._call({'input': []}, Receipt(max_usd=1), 'translation', tier='flex', session=session)
+    assert waits == [translate.FLEX_WAIT] * 2 and [b['service_tier'] for b in session.bodies] == ['flex'] * 3
+
+
+def test_a_full_or_slow_flex_tier_hands_the_job_to_the_default_tier_for_a_while(monkeypatch):
+    session = Session([Response(429)] * translate.FLEX_ATTEMPTS + [
+        answer([{'id': 1, 'voiceover': 'Labas.', 'subtitles': ['a', 'b']}], tier='default')])
+    receipt = Receipt(max_usd=1)
+    translate._call({'input': []}, receipt, 'translation', tier='flex', session=session)
+    assert [b['service_tier'] for b in session.bodies] == ['flex'] * translate.FLEX_ATTEMPTS + ['default']
     assert receipt.entries[0]['tier'] == 'default'
+    # The next flex request goes straight to the default tier, until the pause is over.
+    session = Session([answer([], tier='default')])
+    translate._call({'input': []}, receipt, 'translation', tier='flex', session=session)
+    assert [b['service_tier'] for b in session.bodies] == ['default']
+    monkeypatch.setattr(translate, '_flex_paused_until', [0.0])
+
+    class Slow(Session):
+        def request(self, method, url, timeout=None, **kwargs):
+            self.timeouts = getattr(self, 'timeouts', []) + [timeout]
+            if kwargs['json']['service_tier'] == 'flex':
+                self.bodies.append(kwargs['json'])
+                raise translate.http.requests.Timeout()
+            return super().request(method, url, timeout=timeout, **kwargs)
+
+    session = Slow([answer([], tier='default')])
+    translate._call({'input': []}, receipt, 'translation', tier='flex', session=session)
+    assert [b['service_tier'] for b in session.bodies] == ['flex', 'default']
+    assert session.timeouts == [translate.FLEX_TIMEOUT, 300] and translate._flex_paused_until[0] > 0
 
 
 def test_a_self_hosted_engine_may_use_another_compatible_server_and_model(monkeypatch):
@@ -247,7 +290,7 @@ def test_analysis_returns_sung_units_and_a_clean_glossary():
     result = translate.analyse(SONG_UNITS, source='ja', target='lt', receipt=receipt, session=session)
     glossary = [{'source': '黒崎一護', 'target': 'Ichigo Kurosaki'}, {'source': '死神', 'target': 'šinigamis'}]
     assert result == {'sung': {1}, 'silent': set(), 'kinds': {1: 'song'}, 'glossary': glossary, 'new': glossary,
-                      'forms': {}}
+                      'forms': {}, 'spoken': {}}
     body = session.bodies[0]
     assert body['text']['format']['name'] == 'transcript_analysis'
     assert payload(body)['units'][0] == {'id': 1, 'start': 34, 'text': '響く本の中へ'}
@@ -290,10 +333,12 @@ def test_failed_analysis_lets_the_job_continue_unchanged():
     decided = [{'source': '黒崎一護', 'target': 'Ichigo Kurosaki'}]
     result = translate.analyse(SONG_UNITS, source='ja', target='lt', receipt=Receipt(max_usd=1),
                                session=Session([Response(401)]), decided=decided)
-    assert result == {'glossary': decided, 'new': [], 'sung': set(), 'silent': set(), 'kinds': {}, 'forms': {}}
+    assert result == {'glossary': decided, 'new': [], 'sung': set(), 'silent': set(), 'kinds': {}, 'forms': {},
+                      'spoken': {}}
     same = translate.analyse(SONG_UNITS + [Unit(3, 50.0, 51.0, [3], 'Aaaah!')], source='lt', target='lt',
                              receipt=Receipt(max_usd=1), session=Session([]))
-    assert same == {'glossary': [], 'new': [], 'sung': set(), 'silent': {3}, 'kinds': {3: 'nonverbal'}, 'forms': {}}
+    assert same == {'glossary': [], 'new': [], 'sung': set(), 'silent': {3}, 'kinds': {3: 'nonverbal'}, 'forms': {},
+                    'spoken': {}}
 
 
 @pytest.mark.parametrize('text', [
@@ -556,20 +601,28 @@ def test_forms_are_attached_only_where_they_fit_the_final_rendering():
     assert translate.with_forms(glossary, None) == glossary
 
 
-def test_translators_get_the_forms_of_the_names_their_chunk_mentions():
+def test_every_request_starts_with_the_same_glossary_so_openai_reads_it_from_its_prompt_cache():
+    rukija = dict.fromkeys(LT_FORMS, 'Rukija')
     glossary = translate.with_forms([{'source': '黒崎一護', 'target': 'Ičigas Kurosakis'},
                                      {'source': 'ルキア', 'target': 'Rukija'}],
-                                    {'黒崎一護': LT_FORMS, 'ルキア': {**dict.fromkeys(LT_FORMS, 'Rukija')}})
+                                    {'黒崎一護': LT_FORMS, 'ルキア': rukija})
     session = Router(voiceover_translation=[answer([
         {'id': 1, 'voiceover': 'Skamba knygoje', 'subtitles': ['Skamba knygoje']},
         {'id': 2, 'voiceover': 'Aš Ičigas Kurosakis.', 'subtitles': ['Aš Ičigas Kurosakis.']}])],
         translation_review=[no_issues()])
     translate.translate(SONG_UNITS, SONG_CUES, source='ja', target='lt', budgets={1: 50, 2: 50},
                         receipt=Receipt(max_usd=1), session=session, glossary=glossary)
-    sent = payload(session.sent('voiceover_translation')[0])['glossary']
-    assert sent == [{'source': '黒崎一護', 'target': 'Ičigas Kurosakis', 'forms': LT_FORMS},
-                    {'source': 'ルキア', 'target': 'Rukija'}]   # Rukia is not in this chunk
-    assert 'An entry with "forms"' in instructions(session.sent('voiceover_translation')[0])
+    # Every name with all its forms (Rukia too, though no unit here says her name), in a message of its own right
+    # after the instructions: the prefix is the same for every chunk and every review, and so is the cache key.
+    shared = {'glossary': [{'source': '黒崎一護', 'target': 'Ičigas Kurosakis', 'forms': LT_FORMS},
+                           {'source': 'ルキア', 'target': 'Rukija', 'forms': rukija}]}
+    translation, review = session.sent('voiceover_translation')[0], session.sent('translation_review')[0]
+    for body in (translation, review):
+        assert json.loads(body['input'][1]['content']) == shared and 'glossary' not in json.loads(
+            body['input'][2]['content'])
+        assert body['prompt_cache_key'].startswith('vocnu-')
+    assert translation['prompt_cache_key'] != review['prompt_cache_key']   # other instructions, another prefix
+    assert 'An entry with "forms"' in instructions(translation)
 
 
 def test_sung_units_get_subtitles_but_no_narration_and_the_glossary_reaches_every_chunk():
@@ -629,6 +682,15 @@ def test_any_case_form_satisfies_the_name_check():
     first = [{'id': 1, 'voiceover': 'Laukiu Ičigo!', 'subtitles': ['Laukiu Ičigo!']}, *FIRST[1:]]
     _, session, stats = run_review(no_issues(), first=first)
     assert session.sent('name_repair') == [] and 'names_missing' not in stats
+
+
+@pytest.mark.parametrize('target, text, said', [
+    ('Aliaska', 'Gyvenu Aliaskoje.', True), ('Galena', 'Skrendam į Galiną.', False),   # another name, not a form
+    ('Antrasis pasaulinis karas', 'Antrojo pasaulinio karo lėktuvas.', True),         # a definite adjective's ending
+    ('Didysis Raudonis', 'Atskrido Didžiojo Raudonio komanda.', True),
+    ('Antrasis pasaulinis karas', 'Pirmojo pasaulinio karo lėktuvas.', False)])
+def test_a_rendering_without_listed_forms_is_said_with_any_ending(target, text, said):
+    assert translate._said({'target': target, 'forms': []}, text) is said
 
 
 # --- 8. Shortening -------------------------------------------------------------------------------------------------
@@ -822,3 +884,182 @@ def test_speaker_turns_name_the_words_that_start_a_new_line():
     assert payload(body)['units'][0]['words'] == '[0]持ってきて [1]やるよ [2]ありがとう'
     assert 'Japanese' in instructions(body) and receipt.total_usd > 0
     assert translate.turns_estimate_usd(units) > 0
+
+
+# --- 10. Real-world names, codes and narration-only voice-overs ---------------------------------------------------
+
+ALASKA = [{'source': 'Alaska', 'target': 'Aliaska'}, {'source': 'Alaska Airlines', 'target': 'Alaska Airlines'},
+          {'source': 'C-46', 'target': 'C-46', 'spoken': 'cė keturiasdešimt šeši'}]
+
+
+def test_the_analysis_asks_for_real_names_as_the_media_writes_them_and_codes_get_their_spoken_words():
+    session = Session([reply({'non_dialogue': [], 'names': [], 'glossary': [
+        {'source': 'Galena', 'target': 'Galena', 'spoken': ''},
+        {'source': 'C-46', 'target': 'C-46', 'spoken': '„cė keturiasdešimt šeši“'},
+        {'source': 'Boeing 737', 'target': 'Boeing 737', 'spoken': 'Boeing 737'},       # no words: nothing to say
+        {'source': 'F-16', 'target': 'F-16', 'spoken': 'ef [šešiolika]'},              # a performance tag
+        {'source': 'Big Red', 'target': 'Didysis Raudonis', 'spoken': 'Didysis Raudonis'}]})])
+    result = translate.analyse(UNITS, source='en', target='lt', receipt=Receipt(max_usd=1), session=session)
+    assert result['spoken'] == {'C-46': ('C-46', 'cė keturiasdešimt šeši')}
+    # Rails stores base renderings only.
+    assert all(set(entry) == {'source', 'target'} for entry in result['new'])
+    text = instructions(session.bodies[0])
+    assert 'good Lithuanian media practice' in text and 'never a spelling that reads as another' not in text
+    assert 'reads as another Lithuanian word or a common' in text and '"spoken"' in text
+    schema = session.bodies[0]['text']['format']['schema']
+    assert schema['properties']['glossary']['items']['required'] == ['source', 'target', 'spoken']
+
+
+def test_a_code_said_longer_than_written_takes_its_spoken_words_out_of_the_lines_budget():
+    units = [Unit(1, 0.0, 4.0, [1], 'The C-46 took off.'), Unit(2, 5.0, 9.0, [2], 'It was cold.')]
+    cues = [Cue(1, 0.0, 4.0, 'The C-46 took off.'), Cue(2, 5.0, 9.0, 'It was cold.')]
+    session = Session([answer([{'id': 1, 'voiceover': 'C-46 pakilo.', 'subtitles': ['C-46 pakilo.']},
+                               {'id': 2, 'voiceover': 'Buvo šalta.', 'subtitles': ['Buvo šalta.']}]), no_issues()])
+    translate.translate(units, cues, source='en', target='lt', budgets={1: 50, 2: 50}, receipt=Receipt(max_usd=1),
+                        session=session, glossary=[{'source': 'C-46', 'target': 'C-46',
+                                                    'spoken': 'cė keturiasdešimt šeši'}])
+    # The narrator says 22 characters where the line writes 4: the rest of the line has 18 fewer.
+    assert [u['max_voiceover_chars'] for u in payload(session.bodies[0])['units']] == [32, 50]
+
+
+def test_spoken_words_are_attached_only_where_they_fit_the_final_rendering():
+    glossary = [{'source': 'C-46', 'target': 'C-46'}, {'source': 'F-16', 'target': 'F16'}]
+    spoken = {'C-46': ('C-46', 'cė keturiasdešimt šeši'), 'F-16': ('F-16', 'ef šešiolika')}
+    assert translate.with_forms(glossary, None, spoken) == [
+        {'source': 'C-46', 'target': 'C-46', 'spoken': 'cė keturiasdešimt šeši'}, {'source': 'F-16', 'target': 'F16'}]
+
+
+def test_a_name_said_only_inside_a_longer_name_belongs_to_that_one():
+    groups = translate._name_groups(ALASKA)
+    assert translate._mentions(groups, 'He flew Alaska Airlines to Galena.', 'en') == {1: 'Alaska Airlines'}
+    assert translate._mentions(groups, 'Alaska Airlines flies all over Alaska.', 'en') == {
+        1: 'Alaska Airlines', 0: 'Alaska'}
+
+
+def test_a_line_that_keeps_the_airlines_name_is_not_asked_for_the_states_name():
+    units = [Unit(1, 0.0, 3.0, [1], 'He flew Alaska Airlines.')]
+    cues = [Cue(1, 0.0, 3.0, 'He flew Alaska Airlines.')]
+    session = Router(voiceover_translation=[answer([{'id': 1, 'voiceover': 'Jis skrido su Alaska Airlines.',
+                                                     'subtitles': ['Jis skrido su Alaska Airlines.']}])],
+                     translation_review=[no_issues()])
+    stats = {}
+    translate.translate(units, cues, source='en', target='lt', budgets={1: 40}, receipt=Receipt(max_usd=1),
+                        session=session, glossary=ALASKA, stats=stats)
+    assert session.sent('name_repair') == [] and 'names_missing' not in stats
+
+
+def test_a_code_the_translator_spelled_out_is_written_as_the_glossary_writes_it():
+    units = [Unit(1, 0.0, 3.0, [1], 'The C-46 took off.')]
+    cues = [Cue(1, 0.0, 3.0, 'The C-46 took off.')]
+    session = Router(voiceover_translation=[answer([{'id': 1, 'voiceover': 'Cė keturiasdešimt šeši pakilo.',
+                                                     'subtitles': ['C-46 pakilo.']}])],
+                     translation_review=[no_issues()])
+    stats = {}
+    result = translate.translate(units, cues, source='en', target='lt', budgets={1: 40}, receipt=Receipt(max_usd=1),
+                                 session=session, glossary=ALASKA, stats=stats)
+    assert result[1]['voiceover'] == 'C-46 pakilo.'
+    assert session.sent('name_repair') == [] and 'names_missing' not in stats
+    assert 'never spelled out' in instructions(session.sent('voiceover_translation')[0])
+
+
+VOICE_CUES = [Cue(1, 0.0, 0.8, 'Hello there.'), Cue(2, 0.8, 4.0, 'How are you doing today, my friend?'),
+              Cue(3, 5.0, 7.0, 'La la la')]
+VOICE_UNITS = [Unit(1, 0.0, 4.0, [1, 2], 'Hello there. How are you doing today, my friend?'),
+               Unit(2, 5.0, 7.0, [3], 'La la la')]
+
+
+def test_a_voice_over_job_translates_dialogue_as_narrator_lines_only():
+    line = 'Labas. Kaip šiandien sekasi, mano drauge?'
+    session = Router(voiceover_translation=[answer([{'id': 1, 'voiceover': line, 'subtitles': []},
+                                                    {'id': 2, 'voiceover': '', 'subtitles': ['La la la']}])],
+                     translation_review=[no_issues()])
+    result = translate.translate(VOICE_UNITS, VOICE_CUES, source='en', target='lt', budgets={1: 60, 2: 20},
+                                 receipt=Receipt(max_usd=1), session=session, sung={2}, narration_only=True)
+    # The narrator line is the unit's subtitle too, shared across its cues by their length; song lyrics still get a
+    # subtitle per cue.
+    assert result[1] == {'voiceover': line, 'subtitles': ['Labas.', 'Kaip šiandien sekasi, mano drauge?']}
+    assert result[2] == {'voiceover': '', 'subtitles': ['La la la']}
+    sent = payload(session.sent('voiceover_translation')[0])['units']
+    assert sent[0]['text'] == VOICE_UNITS[0].text and 'cues' not in sent[0]
+    assert sent[1]['cues'] == [{'max_chars': 84, 'text': 'La la la'}]
+    reviewed = payload(session.sent('translation_review')[0])['units']
+    assert reviewed[0]['voiceover'] == line and 'cues' not in reviewed[0] and reviewed[1]['cues'][0]['subtitle']
+    assert 'A unit given as one source "text"' in instructions(session.sent('voiceover_translation')[0])
+    assert 'narrated only' in instructions(session.sent('translation_review')[0])
+
+
+def test_a_review_correction_of_a_narrated_unit_needs_no_subtitles():
+    line, fixed = 'Labas. Kaip sekasi, drauge?', 'Labas. Kaip šiandien sekasi, mano drauge?'
+    session = Router(voiceover_translation=[answer([{'id': 1, 'voiceover': line, 'subtitles': []}])],
+                     translation_review=[reply({'issues': [issue(1, fixed, [], 'omission')]}), no_issues()])
+    result = translate.translate(VOICE_UNITS[:1], VOICE_CUES[:2], source='en', target='lt', budgets={1: 60},
+                                 receipt=Receipt(max_usd=1), session=session, narration_only=True)
+    assert result[1]['voiceover'] == fixed and ' '.join(result[1]['subtitles']) == fixed
+
+
+def test_parallel_requests_give_the_first_one_a_head_start_and_keep_their_order(monkeypatch):
+    import time
+    monkeypatch.setattr(translate, 'STAGGER', 0.2)
+    started, others = {}, threading.Event()
+
+    def work(item):
+        started[item] = time.monotonic()
+        if item == 0:
+            others.wait(2.0)   # still running when the others start
+        else:
+            others.set()
+        return item * 10
+
+    assert translate._parallel(work, range(4)) == [0, 10, 20, 30]
+    assert min(started[k] for k in (1, 2, 3)) - started[0] >= 0.18
+    # A first request that is done early does not hold the others back for the whole head start.
+    started.clear()
+    begin = time.monotonic()
+    assert translate._parallel(lambda item: started.setdefault(item, time.monotonic()) and item, [5, 6]) == [5, 6]
+    assert time.monotonic() - begin < 0.15
+
+
+def test_requests_that_start_alike_share_a_prompt_cache_key_that_only_openai_gets(monkeypatch):
+    body = {'input': translate._messages('rules', {'units': [1]}, {'glossary': [{'source': 'a', 'target': 'b'}]})}
+    other = {'input': translate._messages('rules', {'units': [2]}, {'glossary': [{'source': 'a', 'target': 'b'}]})}
+    assert translate._cache_key(body) == translate._cache_key(other) is not None
+    assert translate._cache_key({'input': translate._messages('other rules', {'units': [1]})}) != \
+        translate._cache_key(body)
+    session = Session([answer([])])
+    translate._call(body, Receipt(max_usd=1), 'translation', session=session)
+    assert session.bodies[0]['prompt_cache_key'] == translate._cache_key(body)
+    monkeypatch.setenv('OPENAI_BASE_URL', 'http://localhost:11434/v1/')
+    session = Session([answer([])])
+    translate._call(body, Receipt(max_usd=1), 'translation', session=session)
+    assert 'prompt_cache_key' not in session.bodies[0] and 'service_tier' not in session.bodies[0]
+
+
+def test_respellings_are_checked_before_the_narrator_gets_them():
+    session = Session([reply({'words': [
+        {'id': 0, 'options': ['Aljaska', 'Aliaska', 'Al jaska', 'Aljaska', 'Aljask4', 'Alijjjjjaska', 'Aliaską']},
+        {'id': 7, 'options': ['Nežinomas']}]})])
+    receipt = Receipt(max_usd=1)
+    result = translate.respell([{'id': 0, 'word': 'Aliaska', 'heard': 'Alaska', 'source': 'Alaska'}],
+                               source='en', target='lt', receipt=receipt, session=session)
+    assert result == {0: ['Aljaska', 'Aliaską']}
+    data = payload(session.bodies[0])
+    assert data == {'words': [{'id': 0, 'word': 'Aliaska', 'heard': 'Alaska', 'source': 'Alaska'}]}
+    text = instructions(session.bodies[0])
+    assert 'look less like the original name' in text
+    assert 'Never another sound or syllable, a longer or shorter vowel' in text
+    assert receipt.total_usd > 0
+    assert translate.respell([{'id': 0, 'word': 'Aliaska'}], source='en', target='lt', receipt=receipt,
+                             session=Session([Response(401)])) == {}
+
+
+def test_many_lines_are_shortened_in_parallel_requests(monkeypatch):
+    monkeypatch.setattr(translate, 'SHORTEN_CHUNK', 2)
+    lines = [{'id': k, 'text': f'Labai labai ilga eilutė numeris {k}.', 'max_chars': 20} for k in range(5)]
+    session = Router(voiceover_shortening=[
+        lambda data: reply({'lines': [{'id': line['id'], 'text': f'Eilutė {line["id"]}.'} for line in data['lines']]})
+        for _ in range(3)])
+    result = translate.shorten(lines, target='lt', receipt=Receipt(max_usd=1), session=session)
+    assert result == {k: f'Eilutė {k}.' for k in range(5)}
+    sent = session.sent('voiceover_shortening')
+    assert sorted(len(payload(body)['lines']) for body in sent) == [1, 2, 2]
+    assert all(body['service_tier'] == 'flex' for body in sent)

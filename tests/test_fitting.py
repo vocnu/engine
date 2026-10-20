@@ -1,4 +1,5 @@
-"""Fitting narrator takes into their timing budgets: retakes, rephrasing, last-resort tempo and silent takes."""
+"""Fitting narrator takes into their timing budgets: retakes, rephrasing, last-resort tempo, silent takes and what the
+narrator says."""
 import math
 
 import pytest
@@ -95,6 +96,31 @@ def test_a_shorter_wording_with_a_longer_take_never_replaces_the_current_one(mon
     assert (narration.report['rephrase_rounds'], narration.report['rephrased_lines']) == (2, 1)
     # The second request shows every wording tried so far with its measured take.
     assert studio.asked[1][0]['previous'] == [{'text': LONG_LINES[1], 'seconds': 3.0}, {'text': first, 'seconds': 3.2}]
+
+
+def test_a_new_wording_must_play_measurably_shorter(monkeypatch):
+    other = 'Kalbėjome apie tiek dalykų, kurie niekaip netelpa.'
+    studio = Studio(monkeypatch, {LONG_LINES[1]: 3.0, other: 2.992, LONG_LINES[2]: 1.0}, rewrites=[{1: other}])
+    narration = narrate(*LONG, LONG_LINES)
+    assert narration.lines[1] == LONG_LINES[1] and narration.report['rephrased_lines'] == 0
+    # The second round sees both wordings; its answer repeats one, so nothing more is bought.
+    assert studio.asked[1][0]['previous'] == [{'text': LONG_LINES[1], 'seconds': 3.0}, {'text': other, 'seconds': 2.99}]
+    assert [text for uid, text, _ in studio.spoken if uid == 1] == [LONG_LINES[1], other]
+
+
+def test_a_line_whose_answer_repeated_a_wording_is_asked_again_while_repairs_buy_speech(monkeypatch):
+    timeline, cues = scene((1.0, 3.0, 'We talked about so many things that never fit.'), (3.1, 4.0, 'Yes.'),
+                           (10.0, 12.0, 'And then we talked about even more things.'), (12.1, 13.0, 'No.'))
+    lines = {1: 'Kalbėjome apie tiek daug dalykų, kurie niekaip netelpa.', 2: 'Taip.',
+             3: 'Paskui kalbėjome apie dar daugiau įvairiausių dalykų.', 4: 'Ne.'}
+    first, third = 'Kalbėjome apie viską.', 'Paskui kalbėjome dar daugiau.'
+    studio = Studio(monkeypatch, {lines[1]: 3.0, lines[3]: 3.0, 'Taip.': 0.5, 'Ne.': 0.5, first: 2.0, third: 2.0},
+                    rewrites=[{3: third}, {1: first}])
+    narration = narrate(timeline, cues, lines)
+    # The first answer repeats line 1, but the round bought line 3's new wording: line 1 is asked again.
+    assert [[line['id'] for line in asked] for asked in studio.asked] == [[1, 3], [1]]
+    assert (narration.lines[1], narration.lines[3]) == (first, third) and narration.violations == []
+    assert (narration.report['rounds'], narration.report['rephrased_lines']) == (2, 2)
 
 
 def test_the_rephrase_request_carries_the_measured_problem_and_the_context(monkeypatch):
@@ -202,3 +228,102 @@ def test_the_first_synthesis_is_not_optional(monkeypatch):
     Studio(monkeypatch, {})
     with pytest.raises(BudgetExceeded):
         narrate(*LONG, LONG_LINES, budget=0.001)
+
+
+def test_the_narrator_says_the_spoken_words_and_the_lines_keep_the_written_ones(monkeypatch):
+    timeline, cues = scene((1.0, 4.0, 'The C-46 flew to Alaska.'), (5.0, 8.0, 'Alaska was cold.'))
+    lines = {1: 'C-46 nuskrido į Aliaską.', 2: 'Aliaska buvo šalta.'}
+    studio = Studio(monkeypatch, {})
+    checked = []
+
+    def respell(narrated, spoken):
+        checked.append((narrated, spoken))
+        return {'Aliaska': 'Aljaska'}
+
+    narration = narrate(timeline, cues, lines, spoken={'C-46': 'cė keturiasdešimt šeši'}, respell=respell)
+    assert checked == [(lines, {'C-46': 'cė keturiasdešimt šeši'})]
+    assert [text for _, text, _ in studio.spoken] == ['cė keturiasdešimt šeši nuskrido į Aliaską.',
+                                                      'Aljaska buvo šalta.']
+    assert narration.lines == lines
+    assert narration.spoken == {'C-46': 'cė keturiasdešimt šeši', 'Aliaska': 'Aljaska'}
+
+
+def test_the_shortening_request_runs_while_the_short_lines_are_retaken(monkeypatch):
+    import threading
+
+    timeline, cues = scene(*((u.start, u.end, u.text) for u in LONG[0][:2]), (6.5, 6.8, 'No!'), (7.2, 9.0, 'Fine.'))
+    lines = {1: LONG_LINES[1], 2: LONG_LINES[2], 3: 'Ne!', 4: 'Gerai.'}
+    studio = Studio(monkeypatch, {LONG_LINES[1]: 3.0, LONG_LINES[2]: 1.0, ('Ne!', 0): 1.4, ('Ne!', 1): 0.4,
+                                  'Gerai.': 0.5})
+    asking, seen = threading.Event(), []
+    synthesize, shorten = studio.synthesize_all, studio.shorten
+
+    def retaken(lines, *args, seeds=None, **options):
+        if seeds:   # a retake: the shortening request has already started
+            seen.append(asking.wait(timeout=5))
+        return synthesize(lines, *args, seeds=seeds, **options)
+
+    def asked(lines, **options):
+        asking.set()
+        return shorten(lines, **options)
+
+    monkeypatch.setattr(tts, 'synthesize_all', retaken)
+    monkeypatch.setattr(translate, 'shorten', asked)
+    narration = narrate(timeline, cues, lines)
+    assert seen == [True] and [line['id'] for line in studio.asked[0]] == [1]
+    assert narration.paths[3] == 'Ne!#1'
+    assert set(narration.report['seconds']) >= {'first_takes', 'retakes', 'shortening'}
+
+
+def test_a_shortening_request_starts_from_the_spoken_length_of_a_line(monkeypatch):
+    timeline, cues = scene((1.0, 3.0, 'The C-46 took off with everything we had on board.'), (9.0, 10.0, 'Fine.'))
+    line = 'C-46 pakilo su viskuo, ką turėjome lėktuve.'
+    said = 'cė keturiasdešimt šeši pakilo su viskuo, ką turėjome lėktuve.'
+    studio = Studio(monkeypatch, {said: 4.0, 'Gerai.': 0.5})
+    narrate(timeline, cues, {1: line, 2: 'Gerai.'}, spoken={'C-46': 'cė keturiasdešimt šeši'})
+    budget = timing.budgets(timeline, 30.0)[1]
+    share = (budget.latest_end - budget.planned_start) / 4.0
+    # The time allows this share of what is said; the code's spoken words stay, the rest of the line shrinks.
+    assert studio.asked[0][0]['max_chars'] == math.floor(len(said) * share * 0.95) - (len(said) - len(line))
+
+
+NAMED = scene((1.0, 3.0, 'Galena is cold.'), (6.0, 8.0, 'Fairbanks is far.'))
+NAMED_LINES = {1: 'Galenoje šalta.', 2: 'Ferbanksas toli.'}
+
+
+class Ear:
+    """Fake final name check: the lines it hears wrong, call by call."""
+
+    def __init__(self, *answers):
+        self.answers, self.heard = list(answers), []
+
+    def __call__(self, takes):
+        self.heard.append({uid: path for uid, (_, path) in takes.items()})
+        answer = self.answers.pop(0) if self.answers else set()
+        return {uid: [('Galenoje', 'Galemoje')] for uid in answer if uid in takes}
+
+
+def test_a_line_whose_name_was_heard_wrong_gets_one_more_take_with_the_next_seed(monkeypatch):
+    studio = Studio(monkeypatch, {('Galenoje šalta.', 0): 1.0, ('Galenoje šalta.', 1): 1.02, 'Ferbanksas toli.': 1.0})
+    ear = Ear({1}, set())
+    narration = narrate(*NAMED, NAMED_LINES, verify=ear)
+    assert offsets(studio, 1) == [0, 1] and narration.paths[1] == 'Galenoje šalta.#1'
+    # Every finished take is heard, then only the new one.
+    assert ear.heard == [{1: 'Galenoje šalta.#0', 2: 'Ferbanksas toli.#0'}, {1: 'Galenoje šalta.#1'}]
+    assert (narration.report['names_misheard'], narration.report['names_retaken']) == (1, 1)
+    assert narration.violations == [] and narration.lines == NAMED_LINES
+
+
+@pytest.mark.parametrize('seconds, heard_again', [(1.02, {1}), (4.5, set())])
+def test_a_name_retake_heard_wrong_again_or_off_its_timing_is_not_kept(monkeypatch, seconds, heard_again):
+    studio = Studio(monkeypatch, {('Galenoje šalta.', 0): 1.0, ('Galenoje šalta.', 1): seconds,
+                                  'Ferbanksas toli.': 1.0})
+    narration = narrate(*NAMED, NAMED_LINES, verify=Ear({1}, heard_again))
+    assert offsets(studio, 1) == [0, 1] and narration.paths[1] == 'Galenoje šalta.#0'
+    assert (narration.report['names_misheard'], narration.report['names_retaken']) == (1, 0)
+
+
+def test_names_heard_right_buy_nothing_more(monkeypatch):
+    studio = Studio(monkeypatch, {})
+    narration = narrate(*NAMED, NAMED_LINES, verify=Ear(set()))
+    assert all(offset == 0 for _, _, offset in studio.spoken) and narration.report['names_retaken'] == 0

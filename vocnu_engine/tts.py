@@ -20,8 +20,11 @@ from .languages import get
 
 MODEL = 'eleven_v3'
 # eleven_v4 lists Lithuanian among its languages (v3 does not) and halved round-trip ASR character errors
-# for the Lithuanian narrator on a demo scene (2026-10-08: 5.4 % vs 10.4 % on v3).
-LANGUAGE_MODELS = {'lt': 'eleven_v4'}
+# for the Lithuanian narrator on a demo scene (2026-10-08: 5.4 % vs 10.4 % on v3). eleven_v4_turbo reads Lithuanian
+# since 2026-10-20: the owner heard no difference from eleven_v4 in side-by-side documentary samples, it bills half
+# the credits, and it times every take exactly as eleven_v4 does (45 documentary lines), so budgets and fitting
+# hold for both.
+LANGUAGE_MODELS = {'lt': 'eleven_v4_turbo'}
 OUTPUT_FORMAT = 'mp3_44100_192'
 API = 'https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/with-timestamps'
 ALIGNMENTS = ('alignment', 'normalized_alignment')

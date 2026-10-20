@@ -42,13 +42,18 @@ class Receipt:
         self.entries.append({'kind': kind, 'provider': provider, 'usd': round(usd, 6), **units})
 
     def openai(self, model, tier, usage):
-        # A model without a known price (a self-hosted engine's own choice) is recorded at $0.
+        # A model without a known price (a self-hosted engine's own choice) is recorded at $0. Input OpenAI reads
+        # from its prompt cache is cheap; input it writes there (every uncached token, since 2026) costs a quarter
+        # more than plain input.
         rate = OPENAI_RATES.get((model, tier), (0.0, 0.0, 0.0, 0.0))
-        cached = (usage.get('input_tokens_details') or {}).get('cached_tokens', 0)
-        fresh = usage.get('input_tokens', 0) - cached
-        usd = (fresh*rate[0] + cached*rate[1] + usage.get('output_tokens', 0)*rate[3]) / 1e6
+        details = usage.get('input_tokens_details') or {}
+        cached, written = details.get('cached_tokens') or 0, details.get('cache_write_tokens') or 0
+        fresh = max(0, usage.get('input_tokens', 0) - cached - written)
+        usd = (fresh*rate[0] + cached*rate[1] + written*rate[2] + usage.get('output_tokens', 0)*rate[3]) / 1e6
+        reasoning = (usage.get('output_tokens_details') or {}).get('reasoning_tokens') or 0
         self.add('text', 'openai', usd, model=model, tier=tier, input_tokens=usage.get('input_tokens', 0),
-                 cached_tokens=cached, output_tokens=usage.get('output_tokens', 0))
+                 cached_tokens=cached, cache_write_tokens=written, output_tokens=usage.get('output_tokens', 0),
+                 reasoning_tokens=reasoning)
         return usd
 
     def as_dict(self):

@@ -5,7 +5,7 @@ import subprocess
 
 import pytest
 
-from vocnu_engine import mix, pipeline, titles, translate, tts
+from vocnu_engine import media, mix, pipeline, render, titles, translate, tts
 from vocnu_engine.storage import LocalStore
 
 
@@ -79,7 +79,8 @@ def fake_providers(monkeypatch, tmp_path):
         return calls.stored(terms) if calls.stored else None
 
     def fake_translate(units, cues, *, source, target, budgets, receipt, session=None, speakers=None, glossary=None,
-                       sung=frozenset(), stats=None, evidence=None):
+                       sung=frozenset(), stats=None, evidence=None, narration_only=False):
+        calls.narration_only = narration_only
         calls.hints.append(speakers)
         calls.glossaries.append(glossary)
         calls.evidence['translation'] = evidence
@@ -180,7 +181,7 @@ def test_full_job_produces_every_contract_output(clip, tmp_path, fake_providers)
     # Both 0.8 s lines fit their gap-aware budgets at natural speed: nothing to repair.
     timing = result['stats']['timing']
     assert timing['violations'] == {'late_start': 0, 'over_budget': 0, 'past_end': 0, 'overlap': 0}
-    assert (timing['sped_up_lines'], timing['retakes'], timing['missing_speech']) == (0, 0, 0)
+    assert (timing['sped_up_lines'], timing['rounds'], timing['missing_speech']) == (0, 0, 0)
 
 
 def test_translation_gets_each_lines_speaker_from_pitch(clip, tmp_path, fake_providers):
@@ -399,10 +400,75 @@ def test_voiceover_audio_comes_in_the_chosen_format(clip, tmp_path, fake_provide
     assert output_path(result, tmp_path, 'subtitles_ass').read_text().startswith('[Script Info]')
 
 
+def test_the_original_soundtrack_comes_on_its_own_only_when_rails_asks_for_it(clip, tmp_path, fake_providers):
+    result, _ = run(job(clip, original_audio=True), tmp_path)
+    assert result['event'] == 'completed', result
+    original = next(o for o in result['outputs'] if o['kind'] == 'original_audio')
+    assert (original['key'].rsplit('/', 1)[1], original['language'], original['content_type']) == \
+        ('original.en.m4a', 'en', 'audio/mp4')
+    assert [s['codec_name'] for s in probe_streams(output_path(result, tmp_path, 'original_audio'))] == ['aac']
+    # A job without a voice-over has no player to play it with.
+    result, _ = run(job(clip, original_audio=True, products={'subtitles': True}), tmp_path / 'subtitles')
+    assert result['event'] == 'completed' and 'original_audio' not in {o['kind'] for o in result['outputs']}
+
+
+def test_a_failed_original_soundtrack_never_fails_the_job(clip, tmp_path, fake_providers, monkeypatch):
+    def broken(*args, **kwargs):
+        raise media.MediaError('ffmpeg failed (1): broken stream')
+
+    monkeypatch.setattr(render, 'original_audio', broken)
+    result, _ = run(job(clip, original_audio=True), tmp_path)
+    assert result['event'] == 'completed', result
+    kinds = {o['kind'] for o in result['outputs']}
+    assert 'original_audio' not in kinds and {'voiceover_audio', 'voiceover_video'} <= kinds
+
+
 def test_unknown_formats_are_rejected(clip, tmp_path, fake_providers):
-    for bad in ({'video_format': 'flv'}, {'audio_format': 'aiff'}):
+    for bad in ({'video_format': 'flv'}, {'audio_format': 'aiff'}, {'video_formats': ['mp4', 'flv']},
+                {'video_formats': 'mp4'}):
         result, _ = run(job(clip, **bad), tmp_path)
         assert result['error']['code'] == 'internal_error'
+
+
+def test_several_video_formats_come_as_one_file_each_with_every_track(clip, tmp_path, fake_providers):
+    products = {'voiceover_video': True, 'voiceover_audio': True, 'subtitles': True}
+    # The list wins over the single format an older Rails sends alongside it.
+    result, sink = run(job(clip, products=products, video_format='mp4', video_formats=['mp4', 'mkv', 'mp4']),
+                       tmp_path)
+    assert result['event'] == 'completed', result
+    videos = [o for o in result['outputs'] if o['kind'] == 'voiceover_video']
+    assert [(o['key'].rsplit('/', 1)[1], o['content_type'], o['language']) for o in videos] == [
+        ('video.lt.mp4', 'video/mp4', 'lt'), ('video.lt.mkv', 'video/x-matroska', 'lt')]
+    for output, subtitle_codec in zip(videos, ['mov_text', 'ass']):
+        streams = probe_streams(tmp_path / 'out' / output['key'])
+        assert [s['codec_name'] for s in streams if s['codec_type'] == 'video'] == ['h264']
+        assert [s['codec_name'] for s in streams if s['codec_type'] == 'audio'] == ['aac', 'aac']
+        assert [(s['codec_name'], s['tags'].get('language')) for s in streams if s['codec_type'] == 'subtitle'] == \
+            [(subtitle_codec, 'lit'), (subtitle_codec, 'eng')]
+        assert ai_disclosed(tmp_path / 'out' / output['key'])
+    rendering = [value for event, stage, value in (e for e in sink.events if e[0] == 'progress')
+                 if stage == 'rendering']
+    assert rendering == sorted(rendering) and len(set(rendering)) >= 3   # entered, then after each file
+
+
+def test_burned_subtitles_in_several_formats_burn_the_picture_once(clip, tmp_path, fake_providers, monkeypatch):
+    from vocnu_engine import render
+    burned = []
+    real_video = render.video
+
+    def video(*args, **kwargs):
+        burned.append(kwargs.get('burn_srt') is not None and kwargs.get('picture') is None)
+        return real_video(*args, **kwargs)
+
+    monkeypatch.setattr(render, 'video', video)
+    result, _ = run(job(clip, video_formats=['mkv', 'mp4']), tmp_path)
+    assert result['event'] == 'completed', result
+    assert burned == [True, False]
+    for name in ('mp4', 'mkv'):
+        streams = probe_streams(tmp_path / 'out' / f'jobs/{job(clip)["job_id"]}/video.lt.{name}')
+        # Burned in, so the target subtitles are not repeated as a track: only the transcript is.
+        assert [s['tags'].get('language') for s in streams if s['codec_type'] == 'subtitle'] == ['eng']
+        assert [s['codec_name'] for s in streams if s['codec_type'] == 'video'] == ['h264']
 
 
 SIGNS_ASS = """[Script Info]
@@ -631,3 +697,54 @@ def test_a_community_voice_reads_the_job_and_is_credited_in_the_outputs(clip, tm
 def test_a_malformed_community_voice_is_refused():
     with pytest.raises(ValueError):
         pipeline.validate({**job(Path('clip.mp4')), 'voice_override': {'id': '../../x', 'name': 'Jonas'}})
+
+
+
+def test_a_voice_over_is_translated_as_narration_only_and_subtitles_alone_per_cue(clip, tmp_path, fake_providers):
+    run(job(clip), tmp_path)
+    assert fake_providers.narration_only is True
+    run(job(clip, products={'subtitles': True}), tmp_path / 'subtitles')
+    assert fake_providers.narration_only is False
+
+
+def test_a_name_the_narrator_says_the_english_way_is_respelled_for_the_voice_only(clip, tmp_path, fake_providers,
+                                                                                  monkeypatch):
+    glossary = [{'source': 'Alaska', 'target': 'Aliaska'}, {'source': 'C-46', 'target': 'C-46'}]
+    forms = dict(zip(('nominative', 'genitive', 'dative', 'accusative', 'instrumental', 'locative', 'vocative'),
+                     ('Aliaska', 'Aliaskos', 'Aliaskai', 'Aliaską', 'Aliaska', 'Aliaskoje', 'Aliaska')))
+    fake_providers.analysis = {'glossary': glossary, 'new': glossary, 'sung': set(), 'silent': set(),
+                               'forms': {'Alaska': forms}, 'spoken': {'C-46': ('C-46', 'cė keturiasdešimt šeši')}}
+    lines = {1: 'Aliaska buvo šalta.', 2: 'C-46 pakilo.'}
+    monkeypatch.setattr(translate, 'translate', lambda units, cues, **kw: {
+        u.id: {'voiceover': lines[u.id], 'subtitles': [lines[u.id]] * len(u.cue_ids)} for u in units})
+    monkeypatch.setattr(translate, 'respell', lambda words, **kw: {0: ['Aljaska']})
+    # The finished take slips back to "Alaska" once: its retake is heard as written.
+    heard = {'names': ' Alaska buvo šalta.', 'respellings': ' Aljaska buvo šalta.', 'final-0': ' Alaska buvo šalta.',
+             'final-1': ' Aljaska buvo šalta.'}
+
+    def transcribe(path, language, hints=()):
+        check = Path(path).stem.rsplit('-', 1)[0]   # a take recognised again is named after the check and the take
+        if check in heard:
+            words = heard[check].split()
+            return {'language': 'lt', 'seconds': 0.5, 'words': [
+                {'start': 0.1 + 0.2 * k, 'end': 0.3 + 0.2 * k, 'word': ' ' + word} for k, word in enumerate(words)]}
+        return {'language': 'en', 'words': WORDS}
+
+    result, _ = run(job(clip), tmp_path, transcribe=transcribe)
+    assert result['event'] == 'completed', result
+    respelled = {'Aliaska': 'Aljaska', 'Aliaskos': 'Aljaskos', 'Aliaskai': 'Aljaskai', 'Aliaską': 'Aljaską',
+                 'Aliaskoje': 'Aljaskoje'}
+    assert result['stats']['pronunciation']['respelled'] == respelled
+    assert result['stats']['pronunciation']['final'] == {'lines': 1, 'misheard': {'Aliaska': ['Alaska']}, 'retaken': 1}
+    assert result['stats']['timing']['names_retaken'] == 1 and 'final_name_check' in result['stats']['timing']['seconds']
+    # The narrator says the respelling and the code's words; the subtitles show what is written.
+    assert 'Aljaska buvo šalta.' in fake_providers.spoken
+    assert 'cė keturiasdešimt šeši pakilo.' in fake_providers.spoken
+    text = output_path(result, tmp_path, 'subtitles_srt').read_text()
+    assert 'Aliaska buvo šalta.' in text and 'C-46 pakilo.' in text and 'Aljaska' not in text and 'cė' not in text
+    plan = json.loads((tmp_path / 'work' / 'plan.json').read_text())
+    assert [u.get('spoken') for u in plan['units']] == ['Aljaska buvo šalta.', 'cė keturiasdešimt šeši pakilo.']
+    assert plan['spoken_forms'] == {'C-46': 'cė keturiasdešimt šeši', **respelled}
+    # Recognising the takes again is GPU time like any other.
+    gpu = [e for e in result['receipt']['entries'] if e['kind'] == 'compute']
+    assert gpu and gpu[0]['asr_seconds'] >= 1.0
